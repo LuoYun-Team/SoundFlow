@@ -31,6 +31,15 @@ public abstract class AudioEngine : IDisposable
     private Thread? _audioThread;
     private readonly ManualResetEvent _audioThreadStarted = new(false);
     private readonly ManualResetEvent _stopAudioThread = new(false);
+    
+    /// <summary>
+    /// Specifies the direction of audio data processing to guide the central processing method.
+    /// </summary>
+    private enum ProcessingDirection
+    {
+        InputFromDevice,
+        OutputToDevice
+    }
 
     /// <summary>
     ///     Constructs a new instance of <see cref="AudioEngine" />.
@@ -58,7 +67,6 @@ public abstract class AudioEngine : IDisposable
 
     private void SetupAudioThread()
     {
-        // Start audio device in a dedicated thread
         if (RequiresBackendThread)
         {
             _audioThread = new Thread(AudioThreadLoop);
@@ -73,41 +81,35 @@ public abstract class AudioEngine : IDisposable
 
     private void AudioThreadLoop()
     {
-        // Backend-specific initialization that requires a separate thread
         InitializeAudioDevice();
-
         _audioThreadStarted.Set();
-
         while (!_stopAudioThread.WaitOne(0))
         {
-            // Process audio data in a loop
             ProcessAudioData();
         }
-
-        // Backend-specific cleanup
         CleanupAudioDevice();
     }
 
     /// <summary>
     ///     Initializes the audio device and starts the audio processing loop.
     /// </summary>
-    protected abstract void InitializeAudioDevice(); // Backend-specific initialization
+    protected abstract void InitializeAudioDevice();
 
     /// <summary>
     ///     Processes audio data in a loop.
     /// </summary>
-    protected abstract void ProcessAudioData(); // Backend-specific audio processing loop
+    protected abstract void ProcessAudioData();
 
     /// <summary>
     ///     Cleans up the audio device.
     /// </summary>
-    protected abstract void CleanupAudioDevice(); // Backend-specific cleanup
-
+    protected abstract void CleanupAudioDevice();
+    
     /// <summary>
     ///     Gets the configured sample format.
     /// </summary>
     public SampleFormat SampleFormat { get; }
-
+    
     /// <summary>
     ///     Gets the configured sample rate (samples per second).
     /// </summary>
@@ -117,17 +119,17 @@ public abstract class AudioEngine : IDisposable
     ///     Gets the inverse of the configured sample rate (seconds per sample).
     /// </summary>
     public float InverseSampleRate { get; }
-
+    
     /// <summary>
     ///     Gets the number of configured audio channels.
     /// </summary>
-    public static int Channels { get; private set; } = 2; // Stereo by default
-
+    public static int Channels { get; private set; } = 2;
+    
     /// <summary>
     ///     Gets or sets the capability of the audio engine.
     /// </summary>
     public Capability Capability { get; }
-
+    
     /// <summary>
     ///     Gets whether the backend requires a dedicated thread for audio processing.
     ///     True if <see cref="AudioEngine"/> manages a backend thread, false otherwise.
@@ -149,7 +151,7 @@ public abstract class AudioEngine : IDisposable
     ///     Gets the number of available capture devices.
     /// </summary>
     public int CaptureDeviceCount { get; protected set; }
-
+    
     /// <summary>
     ///     Gets the number of available playback devices.
     /// </summary>
@@ -164,7 +166,7 @@ public abstract class AudioEngine : IDisposable
     ///     Gets an array of available capture devices.
     /// </summary>
     public DeviceInfo[] CaptureDevices { get; protected set; } = [];
-
+    
     /// <summary>
     ///     Gets the audio engine instance.
     /// </summary>
@@ -174,10 +176,7 @@ public abstract class AudioEngine : IDisposable
     /// <summary>
     ///     Cleans up resources before the object is garbage collected.
     /// </summary>
-    ~AudioEngine()
-    {
-        Dispose(false);
-    }
+    ~AudioEngine() => Dispose(false);
 
     /// <summary>
     ///     Solos the specified sound component, muting all other components.
@@ -191,7 +190,7 @@ public abstract class AudioEngine : IDisposable
             _soloedComponent = component;
         }
     }
-
+    
     /// <summary>
     ///     Unsolos the specified sound component.
     /// </summary>
@@ -209,177 +208,236 @@ public abstract class AudioEngine : IDisposable
     }
 
     /// <summary>
-    ///     Processes the audio graph synchronously.
+    ///     Processes the audio graph synchronously for playback.
     /// </summary>
     /// <param name="output">A pointer to the output buffer.</param>
     /// <param name="length">The length of the output buffer in samples.</param>
     protected void ProcessGraph(nint output, int length)
     {
-        if (length <= 0 || output == nint.Zero)
+        ProcessAudio(output, length, ProcessingDirection.OutputToDevice);
+    }
+
+    /// <summary>
+    ///     Processes the audio input from the device.
+    /// </summary>
+    /// <param name="input">A pointer to the input buffer containing raw device data.</param>
+    /// <param name="length">The length of the input buffer in samples.</param>
+    protected void ProcessAudioInput(nint input, int length)
+    {
+        ProcessAudio(input, length, ProcessingDirection.InputFromDevice);
+    }
+    
+    /// <summary>
+    /// Centralized method to handle audio processing, abstracting buffer management and format conversion.
+    /// </summary>
+    private void ProcessAudio(nint deviceBufferPtr, int length, ProcessingDirection direction)
+    {
+        if (length <= 0 || deviceBufferPtr == nint.Zero)
             return;
 
-        // Use a local variable to store the processed float samples
-        float[]? tempBuffer = null;
-        Span<float> buffer;
-
+        // Fast path for F32: process directly on the device buffer without conversion or allocation.
         if (SampleFormat == SampleFormat.F32)
-            buffer = Extensions.GetSpan<float>(output, length);
-        else
         {
-            tempBuffer = ArrayPool<float>.Shared.Rent(length);
-            buffer = tempBuffer.AsSpan(0, length);
+            var floatBuffer = Extensions.GetSpan<float>(deviceBufferPtr, length);
+            if (direction == ProcessingDirection.InputFromDevice)
+            {
+                OnAudioProcessed?.Invoke(floatBuffer, Capability.Record);
+            }
+            else // OutputToDevice
+            {
+                lock (_lock)
+                {
+                    if (_soloedComponentExists)
+                        _soloedComponent?.Process(floatBuffer);
+                    else
+                        Mixer.Master.Process(floatBuffer);
+                }
+                OnAudioProcessed?.Invoke(floatBuffer, Capability.Playback);
+            }
+            return;
         }
 
-
-        // Process soloed component or the entire graph
-        lock (_lock)
-        {
-            if (_soloedComponentExists)
-                _soloedComponent?.Process(buffer);
-            else
-                Mixer.Master.Process(buffer);
-        }
-
-        // Handle output based on sample format
-        switch (SampleFormat)
-        {
-            case SampleFormat.S16:
-                ConvertAndCopyToOutput<short>(output, length, buffer, short.MaxValue);
-                break;
-            case SampleFormat.S24: // For Signed 24-bit PCM, using int for conversion
-                ConvertAndCopyToOutputS24(output, length, buffer);
-                break;
-            case SampleFormat.S32:
-                ConvertAndCopyToOutput<int>(output, length, buffer, int.MaxValue);
-                break;
-            case SampleFormat.U8: // Unsigned 8-bit PCM
-                ConvertAndCopyToOutput<byte>(output, length, buffer, 128, true);
-                break;
-            case SampleFormat.F32:
-                break;
-            default:
-                throw new NotSupportedException($"Sample format {SampleFormat} is not supported.");
-        }
-
-        OnAudioProcessed?.Invoke(buffer, Capability.Playback);
-
-        if (tempBuffer != null)
-            ArrayPool<float>.Shared.Return(tempBuffer);
-    }
-
-    private static void ConvertAndCopyToOutputS24(nint output, int length, Span<float> floatBuffer)
-    {
-        // Get a span of bytes representing the output buffer
-        var outputSpan = Extensions.GetSpan<byte>(output, length * 3); // 3 bytes per S24 sample
-
-        for (int i = 0, j = 0; i < length; i++, j += 3)
-        {
-            var clipped = Math.Clamp(floatBuffer[i], -1f, 1f);
-            var sample24 = (int)(clipped * 8388607); // 2^23 - 1  (maximum positive value for 24-bit signed)
-
-            // Manually pack the 24-bit sample into 3 bytes (Little Endian)
-            outputSpan[j] = (byte)(sample24 & 0xFF);
-            outputSpan[j + 1] = (byte)((sample24 >> 8) & 0xFF);
-            outputSpan[j + 2] = (byte)((sample24 >> 16) & 0xFF);
-
-            floatBuffer[i] = 0;
-        }
-    }
-
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void ConvertAndCopyToOutput<T>(nint output, int length, Span<float> floatBuffer, float maxValue, bool isUnsigned = false) where T : unmanaged
-    {
-        // Parameter validation
-        ArgumentOutOfRangeException.ThrowIfNegative(length);
-        if (length == 0) return;
-        if (float.IsNaN(maxValue) || float.IsInfinity(maxValue))
-            throw new ArgumentException("maxValue must be a finite number", nameof(maxValue));
-        if (output == nint.Zero) throw new ArgumentNullException(nameof(output));
-
-        var outputSpan = Extensions.GetSpan<T>(output, length);
+        // For other formats, rent a temporary float buffer for processing.
+        float[] tempBuffer = ArrayPool<float>.Shared.Rent(length);
+        var processBuffer = tempBuffer.AsSpan(0, length);
 
         try
         {
-            if (typeof(T) == typeof(byte))
+            if (direction == ProcessingDirection.InputFromDevice)
             {
-                var unsignedOffset = isUnsigned ? maxValue : 0f;
-                const float scale = byte.MaxValue;
-                for (var i = 0; i < length; i++)
-                {
-                    var sample = floatBuffer[i];
-                    if (!float.IsFinite(sample))
-                    {
-                        Unsafe.As<T, byte>(ref outputSpan[i]) = (byte)(scale * 0.5f);
-                        continue;
-                    }
-                    var clipped = Math.Clamp(sample, -1f, 1f);
-                    var scaled = clipped * maxValue + unsignedOffset;
-                    Unsafe.As<T, byte>(ref outputSpan[i]) = (byte)Math.Clamp(scaled, 0f, scale);
-                }
+                // Convert from device format to our internal float format.
+                ConvertFromDeviceFormat(deviceBufferPtr, processBuffer, length);
+                // Now, process the converted float data.
+                OnAudioProcessed?.Invoke(processBuffer, Capability.Record);
             }
-            else if (typeof(T) == typeof(short))
+            else // OutputToDevice
             {
-                var unsignedOffset = isUnsigned ? maxValue : 0f;
-                float min = isUnsigned ? 0 : short.MinValue;
-                const float max = short.MaxValue;
-                for (var i = 0; i < length; i++)
+                // First, fill the float buffer with audio data.
+                lock (_lock)
                 {
-                    var sample = floatBuffer[i];
-                    if (!float.IsFinite(sample))
-                    {
-                        Unsafe.As<T, short>(ref outputSpan[i]) = (short)(isUnsigned ? max * 0.5f : 0);
-                        continue;
-                    }
-                    var clipped = Math.Clamp(sample, -1f, 1f);
-                    var scaled = clipped * maxValue + unsignedOffset;
-                    Unsafe.As<T, short>(ref outputSpan[i]) = (short)Math.Clamp(scaled, min, max);
+                    if (_soloedComponentExists)
+                        _soloedComponent?.Process(processBuffer);
+                    else
+                        Mixer.Master.Process(processBuffer);
                 }
-            }
-            else if (typeof(T) == typeof(int))
-            {
-                var unsignedOffset = isUnsigned ? maxValue : 0f;
-                float min = isUnsigned ? 0 : int.MinValue;
-                const float max = int.MaxValue;
-                for (var i = 0; i < length; i++)
-                {
-                    var sample = floatBuffer[i];
-                    if (!float.IsFinite(sample))
-                    {
-                        Unsafe.As<T, int>(ref outputSpan[i]) = (int)(isUnsigned ? max * 0.5f : 0);
-                        continue;
-                    }
-                    var clipped = Math.Clamp(sample, -1f, 1f);
-                    var scaled = clipped * maxValue + unsignedOffset;
-                    Unsafe.As<T, int>(ref outputSpan[i]) = (int)Math.Clamp(scaled, min, max);
-                }
-            }
-            else
-            {
-                throw new NotSupportedException($"Unsupported output format: {typeof(T)}");
+                OnAudioProcessed?.Invoke(processBuffer, Capability.Playback);
+                // Now, convert from our float format to the device format.
+                ConvertToDeviceFormat(processBuffer, deviceBufferPtr, length);
             }
         }
         finally
         {
-            floatBuffer.Clear();
+            ArrayPool<float>.Shared.Return(tempBuffer);
         }
     }
 
+    /// <summary> Dispatches conversion from a float buffer to the appropriate device format. </summary>
+    private void ConvertToDeviceFormat(Span<float> source, nint destination, int length)
+    {
+        switch (SampleFormat)
+        {
+            case SampleFormat.S16:  ConvertFloatTo<short>(source, destination, length); break;
+            case SampleFormat.S32:  ConvertFloatTo<int>(source, destination, length); break;
+            case SampleFormat.U8:   ConvertFloatTo<byte>(source, destination, length); break;
+            case SampleFormat.S24:  ConvertFloatToS24(source, destination, length); break;
+            default: throw new NotSupportedException($"Sample format {SampleFormat} is not supported for output.");
+        }
+    }
+    
+    /// <summary> Dispatches conversion from a raw device buffer to a float buffer. </summary>
+    private void ConvertFromDeviceFormat(nint source, Span<float> destination, int length)
+    {
+        switch (SampleFormat)
+        {
+            case SampleFormat.S16:  ConvertFrom<short>(source, destination, length); break;
+            case SampleFormat.S32:  ConvertFrom<int>(source, destination, length); break;
+            case SampleFormat.U8:   ConvertFrom<byte>(source, destination, length); break;
+            case SampleFormat.S24:  ConvertFromS24(source, destination, length); break;
+            default: throw new NotSupportedException($"Sample format {SampleFormat} is not supported for input.");
+        }
+    }
+    
+    #region Generic Conversion Methods
 
     /// <summary>
-    ///     Called by an implementation when the audio input has captured samples.
+    /// Converts a buffer of float samples to a specified integer PCM format and writes to a native memory location.
     /// </summary>
-    /// <param name="input">A pointer to the input buffer.</param>
-    /// <param name="length">The length of the input buffer in samples.</param>
-    protected void ProcessAudioInput(nint input, int length)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ConvertFloatTo<T>(Span<float> floatBuffer, nint output, int length) where T : unmanaged
     {
-        if (length <= 0 || input == nint.Zero)
-            return;
-
-        var inputBuffer = Extensions.GetSpan<float>(input, length);
-        OnAudioProcessed?.Invoke(inputBuffer, Capability.Record);
+        if (typeof(T) == typeof(byte))
+        {
+            var byteSpan = Extensions.GetSpan<byte>(output, length);
+            for (var i = 0; i < length; i++)
+            {
+                var clipped = Math.Clamp(floatBuffer[i], -1f, 1f);
+                byteSpan[i] = (byte)((clipped * 127.5f) + 127.5f); // Scale [-1,1] to [0,255]
+            }
+        }
+        else if (typeof(T) == typeof(short))
+        {
+            var shortSpan = Extensions.GetSpan<short>(output, length);
+            for (var i = 0; i < length; i++)
+            {
+                var clipped = Math.Clamp(floatBuffer[i], -1f, 1f);
+                shortSpan[i] = (short)(clipped * short.MaxValue);
+            }
+        }
+        else if (typeof(T) == typeof(int))
+        {
+            var intSpan = Extensions.GetSpan<int>(output, length);
+            const double scale = int.MaxValue;
+            for (var i = 0; i < length; i++)
+            {
+                var clipped = Math.Clamp(floatBuffer[i], -1f, 1f);
+                intSpan[i] = (int)(clipped * scale);
+            }
+        }
+        else
+        {
+            throw new NotSupportedException($"Unsupported output format: {typeof(T)}");
+        }
+        floatBuffer.Clear();
     }
 
+    /// <summary>
+    /// Converts a native buffer from a specified integer PCM format to a buffer of float samples.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ConvertFrom<T>(nint input, Span<float> floatBuffer, int length) where T : unmanaged
+    {
+        if (typeof(T) == typeof(byte))
+        {
+            var byteSpan = Extensions.GetSpan<byte>(input, length);
+            const float scale = 1f / 128f;
+            for (var i = 0; i < length; i++)
+            {
+                int originalSample = byteSpan[i];
+                var dither = ((float)Random.Shared.NextDouble() - (float)Random.Shared.NextDouble());
+                var ditheredSample = originalSample != 0 ? originalSample + dither : originalSample;
+                floatBuffer[i] = (ditheredSample - 128f) * scale;
+            }
+        }
+        else if (typeof(T) == typeof(short))
+        {
+            var shortSpan = Extensions.GetSpan<short>(input, length);
+            const float scale = 1f / 32767f;
+            for (var i = 0; i < length; i++)
+            {
+                floatBuffer[i] = shortSpan[i] * scale;
+            }
+        }
+        else if (typeof(T) == typeof(int))
+        {
+            var intSpan = Extensions.GetSpan<int>(input, length);
+            const double scale = 1.0 / 2147483647.0;
+            for (var i = 0; i < length; i++)
+            {
+                floatBuffer[i] = (float)(intSpan[i] * scale);
+            }
+        }
+        else
+        {
+            throw new NotSupportedException($"Unsupported input format: {typeof(T)}");
+        }
+    }
+
+    /// <summary>
+    /// Converts a buffer of float samples to 24-bit PCM format, packing them into a native byte buffer.
+    /// </summary>
+    private static void ConvertFloatToS24(Span<float> floatBuffer, nint output, int length)
+    {
+        var outputSpan = Extensions.GetSpan<byte>(output, length * 3);
+        for (int i = 0, j = 0; i < length; i++, j += 3)
+        {
+            var clipped = Math.Clamp(floatBuffer[i], -1f, 1f);
+            var sample24 = (int)(clipped * 8388607);
+
+            outputSpan[j] = (byte)sample24;
+            outputSpan[j + 1] = (byte)(sample24 >> 8);
+            outputSpan[j + 2] = (byte)(sample24 >> 16);
+        }
+        floatBuffer.Clear();
+    }
+    
+    /// <summary>
+    /// Converts a native 24-bit PCM byte buffer to a buffer of float samples.
+    /// </summary>
+    private static void ConvertFromS24(nint input, Span<float> floatBuffer, int length)
+    {
+        var inputSpan = Extensions.GetSpan<byte>(input, length * 3);
+        const float scale = 1f / 8388607f;
+        for (int i = 0, j = 0; i < length; i++, j += 3)
+        {
+            int sample24 = (inputSpan[j]) | (inputSpan[j + 1] << 8) | (inputSpan[j + 2] << 16);
+            if ((sample24 & 0x800000) != 0)
+                sample24 |= unchecked((int)0xFF000000);
+            floatBuffer[i] = sample24 * scale;
+        }
+    }
+
+    #endregion
+    
     /// <summary>
     ///     Constructs a sound encoder specific to the implementation.
     /// </summary>
@@ -391,14 +449,14 @@ public abstract class AudioEngine : IDisposable
     /// <returns>An instance of a sound encoder.</returns>
     public abstract ISoundEncoder CreateEncoder(Stream stream, EncodingFormat encodingFormat,
         SampleFormat sampleFormat, int channels, int sampleRate);
-
+    
     /// <summary>
     ///     Constructs a sound decoder specific to the implementation.
     /// </summary>
     /// <param name="stream">The stream containing the audio data.</param>
     /// <returns>An instance of a sound decoder.</returns>
     public abstract ISoundDecoder CreateDecoder(Stream stream);
-
+    
     /// <summary>
     ///     Switches the audio engine to use the specified device.
     /// </summary>
@@ -412,7 +470,7 @@ public abstract class AudioEngine : IDisposable
     /// <param name="playbackDeviceInfo">The playback device to switch to. <c>null</c> to keep the current playback device.</param>
     /// <param name="captureDeviceInfo">The capture device to switch to. <c>null</c> to keep the current capture device.</param>
     public abstract void SwitchDevices(DeviceInfo? playbackDeviceInfo, DeviceInfo? captureDeviceInfo);
-
+    
     /// <summary>
     ///     Retrieves the list of available playback and capture devices from the underlying audio backend.
     /// </summary>
@@ -420,7 +478,7 @@ public abstract class AudioEngine : IDisposable
     ///     This method should be called after any changes to the audio device configuration.
     /// </remarks>
     public abstract void UpdateDevicesInfo();
-    
+
     /// <summary>
     ///     Occurs when samples are processed by Input or Output components.
     /// </summary>
@@ -439,15 +497,12 @@ public abstract class AudioEngine : IDisposable
     /// <param name="disposing">True if called from Dispose(), false if called from finalizer.</param>
     protected virtual void Dispose(bool disposing)
     {
-        if (IsDisposed)
-            return;
-
+        if (IsDisposed) return;
         if (RequiresBackendThread)
         {
             _stopAudioThread.Set();
             _audioThread?.Join();
         }
-
         _instance = null;
         IsDisposed = true;
     }
