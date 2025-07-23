@@ -150,7 +150,7 @@ internal static class Program
         var playbackDevice = Engine.InitializePlaybackDevice(deviceInfo.Value, Format, DeviceConfig);
         playbackDevice.Start();
         
-        using ISoundDataProvider dataProvider = isNetworked ? new NetworkDataProvider(Engine, Format, filePath) : new AssetDataProvider(Engine, Format, new FileStream(filePath, FileMode.Open, FileAccess.Read));
+        using ISoundDataProvider dataProvider = isNetworked ? new NetworkDataProvider(Engine, Format, filePath) : new StreamDataProvider(Engine, Format, new FileStream(filePath, FileMode.Open, FileAccess.Read));
         using var soundPlayer = new SoundPlayer(Engine, Format, dataProvider);
         
         playbackDevice.MasterMixer.AddComponent(soundPlayer);
@@ -273,7 +273,7 @@ internal static class Program
         {
             if (player.State != PlaybackState.Stopped)
             {
-                Console.Write($"\rTime: {TimeSpan.FromSeconds(player.Time):mm\\:ss} / {TimeSpan.FromSeconds(player.Duration):mm\\:ss} | Speed: {player.PlaybackSpeed:F1}x | Vol: {player.Volume:F1}  ");
+                Console.Write($"\rTime: {TimeSpan.FromSeconds(player.Time):mm\\:ss\\.ff} / {TimeSpan.FromSeconds(player.Duration):mm\\:ss\\.ff} | Speed: {player.PlaybackSpeed:F1}x | Vol: {player.Volume:F1}  ");
             }
         };
         timer.Start();

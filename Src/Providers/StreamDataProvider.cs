@@ -25,8 +25,7 @@ public sealed class StreamDataProvider : ISoundDataProvider
         _decoder = engine.CreateDecoder(stream, format);
         SampleRate = _decoder.SampleRate;
 
-        _decoder.EndOfStreamReached += (_, args) =>
-            EndOfStreamReached?.Invoke(this, args);
+        _decoder.EndOfStreamReached += EndOfStreamReached;
     }
 
     /// <inheritdoc />
@@ -83,6 +82,7 @@ public sealed class StreamDataProvider : ISoundDataProvider
     public void Dispose()
     {
         if (IsDisposed) return;
+        _decoder.EndOfStreamReached -= EndOfStreamReached;
         _decoder.Dispose();
         _stream.Dispose();
         IsDisposed = true;
