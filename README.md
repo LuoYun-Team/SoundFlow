@@ -207,13 +207,11 @@ You can directly support SoundFlow and help me get essential headphones through:
 
     [Donate using AirTM](https://airtm.me/lsxprime)
 
-*   **Binance Pay (Crypto - Preferred):** Support with cryptocurrency via Binance Pay.
+*   **USDT (Tron/TRC20):** Supporting directly by sending to the following USDT wallet address.
 
-    [Binance Pay QR Code/Link](https://app.binance.com/qr/dplk0837ff4256a64749a2b10dfe3ea5a0b9)
+    `TKZzeB71XacY3Av5rnnQVrz2kQqgzrkjFn`
 
-    You can also scan this QR code in your Camera app:
-
-[![photo-2025-02-08-13-36-41.jpg](https://i.postimg.cc/02cL1X8K/photo-2025-02-08-13-36-41.jpg)](https://postimg.cc/9rwxGpwc)
+    **Important:** Please ensure you are sending USDT via the **TRC20 (Tron)** network. Sending funds on any other network may result in their permanent loss.
 
 **By becoming a sponsor or making a donation, you directly contribute to the future of SoundFlow and help ensure it sounds great for everyone. Thank you for your generosity!**
 
