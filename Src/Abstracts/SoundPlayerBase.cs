@@ -18,7 +18,6 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
     private float _playbackSpeed = 1.0f;
     private int _loopStartSamples;
     private int _loopEndSamples = -1;
-    private bool _loopingSeekPending;
     private readonly WsolaTimeStretcher _timeStretcher;
     private readonly float[] _timeStretcherInputBuffer;
     private int _timeStretcherInputBufferValidSamples;
@@ -102,6 +101,14 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
         {
             output.Clear();
             return;
+        }
+        
+        // Proactively check for looping before generating audio. This handles loops where a specific end point is set.
+        if (IsLooping && _loopEndSamples != -1)
+        {
+            // Ensure loop is valid and we've reached or passed the end point.
+            if (_loopStartSamples < _loopEndSamples && _rawSamplePosition >= _loopEndSamples)
+                Seek(_loopStartSamples, channels);
         }
 
         // Directly read from provider when playback speed is 1.0
@@ -319,7 +326,7 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
             int samplesWrittenToResample, samplesConsumedFromStretcherInputBuf, sourceSamplesForThisProcessCall;
 
             // Determine how to call the time stretcher (Process or Flush).
-            if (inputSpanForStretcher.IsEmpty && providerExhausted && !_loopingSeekPending)
+            if (inputSpanForStretcher.IsEmpty && providerExhausted)
             {
                 // If the input buffer for the stretcher is empty AND we know the provider is exhausted, flush the stretcher.
                 samplesWrittenToResample = _timeStretcher.Flush(outputSpanForStretcher);
@@ -332,10 +339,6 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
                 samplesWrittenToResample = _timeStretcher.Process(inputSpanForStretcher, outputSpanForStretcher,
                     out samplesConsumedFromStretcherInputBuf,
                     out sourceSamplesForThisProcessCall);
-            }
-            else if (_loopingSeekPending)
-            {
-                break;
             }
             else
             {
@@ -350,8 +353,7 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
             totalSourceSamplesRepresented += sourceSamplesForThisProcessCall;
 
             // Break if no progress was made and no more data is expected.
-            if (samplesWrittenToResample == 0 && samplesConsumedFromStretcherInputBuf == 0 &&
-                providerExhausted && !_loopingSeekPending) break;
+            if (samplesWrittenToResample == 0 && samplesConsumedFromStretcherInputBuf == 0 && providerExhausted) break;
         }
 
         return totalSourceSamplesRepresented;
@@ -359,12 +361,13 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
 
     /// <summary>
     /// Handles the end-of-stream condition, including looping and stopping.
+    /// This is called when the data provider is fully exhausted (ReadBytes returns 0).
     /// </summary>
     /// <param name="remainingOutputBuffer">The buffer for remaining output.</param>
     /// <param name="channels">The number of channels.</param>
     protected virtual void HandleEndOfStream(Span<float> remainingOutputBuffer, int channels)
     {
-        // For live streams with unknown length, don't treat buffer underflow as end-of-stream
+        // Not looping, and it's a file with a known length. This is the definitive end.
         if (!IsLooping && _dataProvider.Length > 0)
         {
             // Original end-of-stream handling
@@ -406,21 +409,27 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
             State = PlaybackState.Stopped;
             OnPlaybackEnded();
         }
+        // Looping is enabled.
         else if (IsLooping)
         {
-            // Original looping handling
             var targetLoopStart = Math.Max(0, _loopStartSamples);
             var actualLoopEnd = (_loopEndSamples == -1)
                 ? _dataProvider.Length
                 : Math.Min(_loopEndSamples, _dataProvider.Length);
 
+            // Check if the loop is valid (start < end, and start is within bounds).
             if (targetLoopStart < actualLoopEnd && targetLoopStart < _dataProvider.Length)
             {
-                _loopingSeekPending = true;
                 Seek(targetLoopStart, channels);
-                _loopingSeekPending = false;
                 if (!remainingOutputBuffer.IsEmpty)
                     GenerateAudio(remainingOutputBuffer, channels);
+            }
+            else
+            {
+                // Loop is not valid (e.g., start >= end), so treat as a normal end-of-stream.
+                State = PlaybackState.Stopped;
+                OnPlaybackEnded();
+                remainingOutputBuffer.Clear();
             }
         }
         // For live streams (Length <= 0), just clear the buffer and continue
@@ -429,7 +438,7 @@ public abstract class SoundPlayerBase : SoundComponent, ISoundPlayer
             remainingOutputBuffer.Clear();
         }
     }
-
+    
     /// <summary>
     /// Invokes the PlaybackEnded event.
     /// </summary>
