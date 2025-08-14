@@ -7,7 +7,6 @@ using SoundFlow.Enums;
 using SoundFlow.Interfaces;
 using SoundFlow.Structs;
 
-
 namespace SoundFlow.Providers;
 
 /// <summary>
@@ -239,6 +238,7 @@ internal abstract class NetworkDataProviderBase(AudioEngine engine, AudioFormat 
 
 /// <summary>
 ///     Handles direct audio streams (e.g., MP3, WAV, OGG files).
+///     Uses a background buffering strategy for large files to prevent network issues from crashing the audio thread.
 /// </summary>
 internal sealed class DirectStreamProvider(AudioEngine engine, AudioFormat format, string url, HttpClient client)
     : NetworkDataProviderBase(engine, format, url, client)
@@ -270,8 +270,10 @@ internal sealed class DirectStreamProvider(AudioEngine engine, AudioFormat forma
         }
         else
         {
-            // Otherwise, use the live network stream. Seeking will not be supported in this case.
-            _stream = await response.Content.ReadAsStreamAsync();
+            // For large or chunked streams, use a buffered stream.
+            var bufferedStream = new BufferedNetworkStream();
+            bufferedStream.StartProducerTask(response); // Starts the background download.
+            _stream = bufferedStream;
         }
         
         _decoder = Engine.CreateDecoder(_stream, Format);
@@ -606,4 +608,170 @@ internal sealed class HlsStreamProvider(AudioEngine engine, AudioFormat format, 
             _audioBuffer.Clear();
         }
     }
+}
+
+/// <summary>
+///     A thread-safe, in-memory stream that acts as a circular buffer between a producer (network download)
+///     and a consumer (audio decoder). It blocks reads when empty and writes when full.
+/// </summary>
+internal sealed class BufferedNetworkStream(int bufferSize = 1 * 1024 * 1024) : Stream
+{
+    private enum DownloadState { Buffering, Completed, Failed }
+
+    private readonly byte[] _buffer = new byte[bufferSize];
+    private int _writePosition;
+    private int _readPosition;
+    private int _bytesAvailable;
+
+    private readonly object _lock = new();
+    private volatile DownloadState _state = DownloadState.Buffering;
+    private CancellationTokenSource? _cts;
+    private Task? _producerTask;
+    private bool _isDisposed;
+    
+    /// <summary>
+    /// Starts the background producer task that reads from the network response and fills the buffer.
+    /// This method takes ownership of the HttpResponseMessage.
+    /// </summary>
+    /// <param name="sourceResponse">The HTTP response message containing the content stream.</param>
+    public void StartProducerTask(HttpResponseMessage sourceResponse)
+    {
+        _cts = new CancellationTokenSource();
+        _producerTask = Task.Run(async () =>
+        {
+            var tempBuffer = ArrayPool<byte>.Shared.Rent(16384); // 16KB read buffer
+            try
+            {
+                await using var sourceStream = await sourceResponse.Content.ReadAsStreamAsync(_cts.Token);
+                while (!_cts.IsCancellationRequested)
+                {
+                    var bytesRead = await sourceStream.ReadAsync(tempBuffer, _cts.Token);
+                    if (bytesRead == 0) break; // End of network stream
+                    
+                    Write(tempBuffer, 0, bytesRead);
+                }
+
+                if (!_cts.IsCancellationRequested) SignalCompletion();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Network error occurred.
+                SignalFailure();
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(tempBuffer);
+                sourceResponse.Dispose();
+            }
+        });
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        lock (_lock)
+        {
+            while (_bytesAvailable == 0 && _state == DownloadState.Buffering && !_isDisposed)
+            {
+                Monitor.Wait(_lock);
+            }
+
+            if (_bytesAvailable == 0) return 0; // End of stream or failure
+
+            var bytesToRead = Math.Min(count, _bytesAvailable);
+            
+            // Read from circular buffer
+            var firstChunkSize = Math.Min(bytesToRead, _buffer.Length - _readPosition);
+            Buffer.BlockCopy(_buffer, _readPosition, buffer, offset, firstChunkSize);
+            _readPosition = (_readPosition + firstChunkSize) % _buffer.Length;
+
+            if (firstChunkSize < bytesToRead)
+            {
+                var secondChunkSize = bytesToRead - firstChunkSize;
+                Buffer.BlockCopy(_buffer, _readPosition, buffer, offset + firstChunkSize, secondChunkSize);
+                _readPosition = (_readPosition + secondChunkSize) % _buffer.Length;
+            }
+            
+            _bytesAvailable -= bytesToRead;
+            Monitor.PulseAll(_lock); // Signal producer that space is available
+            return bytesToRead;
+        }
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        if (count == 0) return;
+
+        lock (_lock)
+        {
+            while (_buffer.Length - _bytesAvailable < count && !_isDisposed)
+            {
+                Monitor.Wait(_lock);
+            }
+            
+            if (_isDisposed) return;
+
+            // Write to circular buffer
+            var firstChunkSize = Math.Min(count, _buffer.Length - _writePosition);
+            Buffer.BlockCopy(buffer, offset, _buffer, _writePosition, firstChunkSize);
+            _writePosition = (_writePosition + firstChunkSize) % _buffer.Length;
+
+            if (firstChunkSize < count)
+            {
+                var secondChunkSize = count - firstChunkSize;
+                Buffer.BlockCopy(buffer, offset + firstChunkSize, _buffer, _writePosition, secondChunkSize);
+                _writePosition = (_writePosition + secondChunkSize) % _buffer.Length;
+            }
+
+            _bytesAvailable += count;
+            Monitor.PulseAll(_lock); // Signal consumer that data is available
+        }
+    }
+
+    private void SignalCompletion()
+    {
+        lock (_lock)
+        {
+            _state = DownloadState.Completed;
+            Monitor.PulseAll(_lock); // Wake any waiting readers to signal EOS
+        }
+    }
+
+    private void SignalFailure()
+    {
+        lock (_lock)
+        {
+            _state = DownloadState.Failed;
+            Monitor.PulseAll(_lock); // Wake any waiting readers to signal EOS
+        }
+    }
+    
+    protected override void Dispose(bool disposing)
+    {
+        if (_isDisposed) return;
+        _isDisposed = true;
+
+        if (disposing)
+        {
+            lock (_lock)
+            {
+                _cts?.Cancel();
+                Monitor.PulseAll(_lock); // Unblock any waiting threads
+            }
+            _producerTask?.Wait(TimeSpan.FromSeconds(5)); // Wait for producer to finish
+            _cts?.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+    
+    #region Not Supported Stream Members
+    public override bool CanRead => !_isDisposed;
+    public override bool CanSeek => false;
+    public override bool CanWrite => !_isDisposed;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    #endregion
 }

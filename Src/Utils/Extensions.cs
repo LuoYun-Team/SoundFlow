@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using SoundFlow.Enums;
+using SoundFlow.Structs;
 
 namespace SoundFlow.Utils;
 
@@ -40,21 +41,45 @@ public static class Extensions
     }
 
     /// <summary>
-    ///     Reads an array of structures from a native memory pointer.
+    ///     Reads an array of structures from a native memory pointer into a pre-allocated destination array.
+    /// </summary>
+    /// <typeparam name="T">The type of the structures to read. Must be a value type.</typeparam>
+    /// <param name="pointer">The native pointer to the start of the array.</param>
+    /// <param name="destination">The pre-allocated array to write the structures into.</param>
+    /// <param name="count">The number of structures to read.</param>
+    /// <exception cref="ArgumentException">Thrown if the destination array is smaller than <paramref name="count"/>.</exception>
+    public static void ReadIntoArray<T>(this nint pointer, T[] destination, int count) where T : struct
+    {
+        if (destination.Length < count)
+        {
+            throw new ArgumentException("Destination array is not large enough to hold the requested number of items.", nameof(destination));
+        }
+
+        if (count == 0) return;
+
+        var elementSize = Marshal.SizeOf<T>();
+        for (var i = 0; i < count; i++)
+        {
+            var currentPtr = (nint)(pointer + (long)i * elementSize);
+            destination[i] = Marshal.PtrToStructure<T>(currentPtr);
+        }
+    }
+
+
+    /// <summary>
+    ///     Reads an array of structures from a native memory pointer, allocating a new managed array.
     /// </summary>
     /// <typeparam name="T">The type of the structures to read. Must be a value type.</typeparam>
     /// <param name="pointer">The native pointer to the start of the array.</param>
     /// <param name="count">The number of structures to read.</param>
-    /// <returns>An array of structures of type <typeparamref name="T"/> read from the specified pointer.</returns>
+    /// <returns>A new array of structures of type <typeparamref name="T"/> read from the specified pointer.</returns>
     public static T[] ReadArray<T>(this nint pointer, int count) where T : struct
     {
+        if (count == 0)
+            return [];
+        
         var array = new T[count];
-        for (var i = 0; i < count; i++)
-        {
-            var currentPtr = (nint)((long)pointer + i * Marshal.SizeOf<T>());
-            array[i] = Marshal.PtrToStructure<T>(currentPtr);
-        }
-
+        ReadIntoArray(pointer, array, count);
         return array;
     }
 }

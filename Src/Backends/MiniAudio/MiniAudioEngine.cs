@@ -57,7 +57,6 @@ public sealed class MiniAudioEngine : AudioEngine
         Native.Free(_context);
     }
     
-
     /// <inheritdoc />
     public override AudioPlaybackDevice InitializePlaybackDevice(DeviceInfo? deviceInfo, AudioFormat format, DeviceConfig? config = null)
     {
@@ -225,27 +224,41 @@ public sealed class MiniAudioEngine : AudioEngine
         if (result != Result.Success)
             throw new InvalidOperationException($"Unable to get devices. MiniAudio result: {result}");
 
-        var playbackCount = (uint)playbackDeviceCountNint;
-        var captureCount = (uint)captureDeviceCountNint;
+        var playbackCountUint = (uint)playbackDeviceCountNint;
+        var captureCountUint = (uint)captureDeviceCountNint;
+        var playbackCount = (int)playbackCountUint;
+        var captureCount = (int)captureCountUint;
 
         try
         {
             // Marshal playback devices
             if (playbackCount > 0 && pPlaybackDevices != nint.Zero)
-                PlaybackDevices = pPlaybackDevices.ReadArray<DeviceInfo>((int)playbackCount);
+            {
+                if (PlaybackDevices.Length != playbackCount) PlaybackDevices = new DeviceInfo[playbackCount];
+                
+                // Read the native device information directly into our managed array.
+                pPlaybackDevices.ReadIntoArray(PlaybackDevices, playbackCount);
+            }
             else
-                PlaybackDevices = [];
+            {
+                if (PlaybackDevices.Length != 0) PlaybackDevices = [];
+            }
 
             // Marshal capture devices
             if (captureCount > 0 && pCaptureDevices != nint.Zero)
-                CaptureDevices = pCaptureDevices.ReadArray<DeviceInfo>((int)captureCount);
+            {
+                if (CaptureDevices.Length != captureCount) CaptureDevices = new DeviceInfo[captureCount];
+                pCaptureDevices.ReadIntoArray(CaptureDevices, captureCount);
+            }
             else
-                CaptureDevices = [];
+            {
+                if (CaptureDevices.Length != 0) CaptureDevices = [];
+            }
         }
         finally
         {
-            if (pPlaybackDevices != nint.Zero) Native.FreeDeviceInfos(pPlaybackDevices, playbackCount);
-            if (pCaptureDevices != nint.Zero) Native.FreeDeviceInfos(pCaptureDevices, captureCount);
+            if (pPlaybackDevices != nint.Zero) Native.FreeDeviceInfos(pPlaybackDevices, playbackCountUint);
+            if (pCaptureDevices != nint.Zero) Native.FreeDeviceInfos(pCaptureDevices, captureCountUint);
         }
     }
 }
